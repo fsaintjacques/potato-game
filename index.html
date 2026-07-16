@@ -1,0 +1,676 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hot Potato</title>
+<style>
+  :root {
+    --paper:  #FAF3E3;
+    --ink:    #46342A;
+    --russet: #D9A05B;
+    --steel:  #5C6670;
+    --heat:   #E4572E;
+    --faint:  rgba(70, 52, 42, 0.45);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+    padding: 24px 16px;
+  }
+  header { text-align: center; user-select: none; }
+  .eyebrow {
+    font-size: 11px;
+    letter-spacing: 0.32em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+  h1 {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-weight: 900;
+    font-size: clamp(34px, 7vw, 56px);
+    letter-spacing: -0.03em;
+    line-height: 1;
+    margin-top: 6px;
+  }
+  h1 .hot { color: var(--heat); }
+  .stage {
+    width: min(920px, 100%);
+    position: relative;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    border: 3px solid var(--ink);
+    border-radius: 10px;
+    background: var(--paper);
+    touch-action: manipulation;
+    cursor: pointer;
+  }
+  footer {
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    color: var(--faint);
+    user-select: none;
+    text-align: center;
+  }
+  footer kbd {
+    font-family: inherit;
+    border: 1px solid var(--faint);
+    border-radius: 4px;
+    padding: 1px 6px;
+    margin: 0 2px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="eyebrow">the countertop escape</div>
+  <h1><span class="hot">HOT</span> POTATO</h1>
+</header>
+
+<div class="stage">
+  <canvas id="game" width="900" height="300" aria-label="Hot Potato: jump over the pots"></canvas>
+</div>
+
+<footer>
+  <kbd>space</kbd>/<kbd>&uarr;</kbd> jump &nbsp;&middot;&nbsp; hold to jump higher &nbsp;&middot;&nbsp; <kbd>&darr;</kbd> dive &nbsp;&middot;&nbsp; <kbd>m</kbd> mute
+</footer>
+
+<script>
+(() => {
+'use strict';
+
+// ---------- setup ----------
+const W = 900, H = 300;
+const GROUND_Y = H - 46;
+const cvs = document.getElementById('game');
+const ctx = cvs.getContext('2d');
+let dpr = 1;
+
+function fit() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cvs.width = W * dpr;
+  cvs.height = H * dpr;
+}
+fit();
+addEventListener('resize', fit);
+
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+const INK    = '#46342A';
+const PAPER  = '#FAF3E3';
+const RUSSET = '#D9A05B';
+const RUSSET_DK = '#B67F42';
+const RUSSET_LT = '#F0C27E';
+const SPOT   = '#8A6437';
+const STEEL  = '#8C97A0';
+const STEEL_DK = '#5C6670';
+const STEEL_LT = '#C6CDD3';
+const HEAT   = '#E4572E';
+
+// ---------- audio ----------
+let audioCtx = null;
+let muted = localStorage.getItem('hotpotato.muted') === '1';
+
+function beep(freq, dur, type = 'square', vol = 0.04, slideTo = null) {
+  if (muted) return;
+  if (!audioCtx) { try { audioCtx = new AudioContext(); } catch { return; } }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  const t = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t);
+  if (slideTo) osc.frequency.linearRampToValueAtTime(slideTo, t + dur);
+  gain.gain.setValueAtTime(vol, t);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(t);
+  osc.stop(t + dur);
+}
+const sfx = {
+  jump:  () => beep(340, 0.09, 'square', 0.035, 560),
+  land:  () => beep(180, 0.05, 'triangle', 0.03),
+  mile:  () => { beep(660, 0.07); setTimeout(() => beep(880, 0.09), 70); },
+  death: () => beep(300, 0.4, 'sawtooth', 0.05, 60),
+};
+
+// ---------- state ----------
+const S = { IDLE: 0, RUN: 1, DEAD: 2 };
+let state = S.IDLE;
+let score = 0;
+let hiScore = +(localStorage.getItem('hotpotato.hi') || 0);
+let speed = 330, dist = 0, spawnGap = 520, diedAt = 0, mileFlash = 0, shake = 0;
+let pots = [], steam = [], dust = [], chunks = [];
+
+const potato = {
+  x: 110, y: GROUND_Y, vy: 0,
+  rx: 21, ry: 16,            // body radii
+  onGround: true, holding: false, diving: false,
+  squash: 0,                 // >0 landing squash timer
+  blink: 0, nextBlink: 1.5,
+  roll: 0,
+};
+
+const GRAVITY = 2300;
+const JUMP_V  = -660;
+const JUMP_CUT = -240;
+
+function reset() {
+  score = 0; dist = 0;
+  speed = 330;
+  pots = []; steam = []; dust = []; chunks = [];
+  spawnGap = 520;
+  potato.y = GROUND_Y; potato.vy = 0;
+  potato.onGround = true; potato.diving = false; potato.squash = 0;
+  state = S.RUN;
+}
+
+// ---------- obstacles ----------
+// Types: saucepan (low, side handle), stockpot (tall, ear handles), double pan.
+function spawnPot() {
+  const r = Math.random();
+  const hard = score > 250;
+  let group;
+  if (r < 0.45)      group = [{ kind: 'sauce', w: 48, h: 34 }];
+  else if (r < 0.75) group = [{ kind: 'stock', w: 52, h: hard ? 62 : 54 }];
+  else               group = [{ kind: 'sauce', w: 44, h: 32 }, { kind: 'sauce', w: 44, h: 32 }];
+
+  let x = W + 40;
+  for (const g of group) {
+    pots.push({
+      x, w: g.w, h: g.h, kind: g.kind,
+      flame: score > 400 && Math.random() < 0.5,
+      puffAt: Math.random() * 0.2,
+    });
+    x += g.w + 6;
+  }
+}
+
+// ---------- particles ----------
+function puff(x, y, big = false) {
+  steam.push({
+    x, y,
+    r: big ? 5 + Math.random() * 4 : 3 + Math.random() * 3,
+    age: 0, life: 1.1 + Math.random() * 0.5,
+    drift: (Math.random() - 0.5) * 14,
+    wob: Math.random() * Math.PI * 2,
+  });
+}
+function kickDust(x, y, n) {
+  for (let i = 0; i < n; i++) {
+    dust.push({
+      x: x + (Math.random() - 0.5) * 18, y,
+      vx: -40 - Math.random() * 60, vy: -30 - Math.random() * 50,
+      r: 1.5 + Math.random() * 2, age: 0, life: 0.35 + Math.random() * 0.2,
+    });
+  }
+}
+function explodeChunks() {
+  for (let i = 0; i < 9; i++) {
+    chunks.push({
+      x: potato.x, y: potato.y - 8,
+      vx: (Math.random() - 0.5) * 320, vy: -120 - Math.random() * 260,
+      r: 3 + Math.random() * 5, rot: Math.random() * 7, vr: (Math.random() - 0.5) * 12,
+      age: 0, life: 0.9,
+    });
+  }
+}
+
+// ---------- input ----------
+function jumpPress() {
+  if (state === S.IDLE) { reset(); return; }
+  if (state === S.DEAD) {
+    if (performance.now() - diedAt > 350) reset();
+    return;
+  }
+  potato.holding = true;
+  if (potato.onGround) {
+    potato.vy = JUMP_V;
+    potato.onGround = false;
+    potato.diving = false;
+    kickDust(potato.x, GROUND_Y, 4);
+    sfx.jump();
+  }
+}
+function jumpRelease() {
+  potato.holding = false;
+  if (potato.vy < JUMP_CUT) potato.vy = JUMP_CUT;
+}
+
+addEventListener('keydown', (e) => {
+  if (e.repeat) return;
+  if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); jumpPress(); }
+  else if (e.code === 'ArrowDown') { e.preventDefault(); potato.diving = true; }
+  else if (e.code === 'KeyM') {
+    muted = !muted;
+    localStorage.setItem('hotpotato.muted', muted ? '1' : '0');
+  } else if (e.code === 'KeyR' && state === S.DEAD) reset();
+});
+addEventListener('keyup', (e) => {
+  if (e.code === 'Space' || e.code === 'ArrowUp') jumpRelease();
+  else if (e.code === 'ArrowDown') potato.diving = false;
+});
+cvs.addEventListener('pointerdown', (e) => { e.preventDefault(); jumpPress(); });
+addEventListener('pointerup', jumpRelease);
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) last = null;   // avoid a giant dt on return
+});
+
+// ---------- update ----------
+function update(dt) {
+  if (state !== S.RUN) {
+    ambient(dt);
+    return;
+  }
+
+  // pace
+  speed = Math.min(700, speed + dt * 7);
+  dist += speed * dt;
+  const prev = score;
+  score = Math.floor(dist / 12);
+  if (Math.floor(score / 100) > Math.floor(prev / 100)) { sfx.mile(); mileFlash = 0.5; }
+  mileFlash = Math.max(0, mileFlash - dt);
+
+  // potato physics
+  const g = potato.diving && !potato.onGround ? GRAVITY * 3 : GRAVITY;
+  potato.vy += g * dt;
+  potato.y += potato.vy * dt;
+  if (potato.y >= GROUND_Y) {
+    if (!potato.onGround) {
+      potato.squash = 0.14;
+      kickDust(potato.x, GROUND_Y, potato.diving ? 8 : 5);
+      sfx.land();
+    }
+    potato.y = GROUND_Y;
+    potato.vy = 0;
+    potato.onGround = true;
+    potato.diving = false;
+  }
+  potato.squash = Math.max(0, potato.squash - dt);
+  potato.roll += (potato.onGround ? speed / 42 : 2.2) * dt;
+
+  // pots
+  spawnGap -= speed * dt;
+  if (spawnGap <= 0) {
+    spawnPot();
+    const min = 250 + speed * 0.55;
+    spawnGap = min + Math.random() * (min * 0.9);
+  }
+  for (const p of pots) {
+    p.x -= speed * dt;
+    p.puffAt -= dt;
+    if (p.puffAt <= 0 && !reducedMotion) {
+      puff(p.x + p.w / 2 + (Math.random() - 0.5) * p.w * 0.5, GROUND_Y - p.h - 4, p.kind === 'stock');
+      p.puffAt = 0.12 + Math.random() * 0.15;
+    }
+  }
+  pots = pots.filter(p => p.x + p.w > -60);
+
+  // collision (forgiving insets)
+  const pb = {
+    x: potato.x - potato.rx + 6, y: potato.y - potato.ry * 2 + 6,
+    w: potato.rx * 2 - 12, h: potato.ry * 2 - 8,
+  };
+  for (const p of pots) {
+    const ob = { x: p.x + 4, y: GROUND_Y - p.h + 4, w: p.w - 8, h: p.h - 4 };
+    if (pb.x < ob.x + ob.w && pb.x + pb.w > ob.x && pb.y < ob.y + ob.h && pb.y + pb.h > ob.y) {
+      die();
+      break;
+    }
+  }
+
+  ambient(dt);
+}
+
+function ambient(dt) {
+  potato.nextBlink -= dt;
+  if (potato.nextBlink <= 0) { potato.blink = 0.12; potato.nextBlink = 1.5 + Math.random() * 2.5; }
+  potato.blink = Math.max(0, potato.blink - dt);
+  for (const s of steam) { s.age += dt; s.y -= 26 * dt; s.x += s.drift * dt; s.wob += 3 * dt; }
+  steam = steam.filter(s => s.age < s.life);
+  for (const d of dust) { d.age += dt; d.x += d.vx * dt; d.y += d.vy * dt; d.vy += 300 * dt; }
+  dust = dust.filter(d => d.age < d.life);
+  for (const c of chunks) {
+    c.age += dt; c.x += c.vx * dt; c.y += c.vy * dt; c.vy += 1400 * dt; c.rot += c.vr * dt;
+    if (c.y > GROUND_Y + 6) { c.y = GROUND_Y + 6; c.vy *= -0.35; c.vx *= 0.7; }
+  }
+  chunks = chunks.filter(c => c.age < c.life);
+  shake = Math.max(0, shake - dt * 3);
+}
+
+function die() {
+  state = S.DEAD;
+  potato.y = GROUND_Y;   // the mash lands on the counter even if hit mid-air
+  diedAt = performance.now();
+  sfx.death();
+  explodeChunks();
+  if (!reducedMotion) shake = 1;
+  if (score > hiScore) {
+    hiScore = score;
+    localStorage.setItem('hotpotato.hi', String(hiScore));
+  }
+}
+
+// ---------- drawing ----------
+function drawShelf() {
+  // faint far-away kitchen shelf, slow parallax
+  ctx.save();
+  ctx.globalAlpha = 0.08;
+  ctx.fillStyle = INK;
+  const span = 700;
+  const off = -(dist * 0.22 % span);
+  for (let base = off - span; base < W + span; base += span) {
+    ctx.fillRect(base + 40, 92, 260, 4);                    // shelf plank
+    ctx.fillRect(base + 70, 62, 26, 30);                    // jar
+    ctx.fillRect(base + 74, 54, 18, 8);
+    ctx.fillRect(base + 120, 48, 16, 44);                   // bottle
+    ctx.fillRect(base + 124, 38, 8, 10);
+    ctx.beginPath(); ctx.arc(base + 210, 78, 15, Math.PI, 0); ctx.fill();  // bowl
+    ctx.fillRect(base + 195, 78, 30, 6);
+    ctx.fillRect(base + 420, 120, 200, 4);                  // lower plank
+    ctx.fillRect(base + 450, 96, 22, 24);                   // tin
+    ctx.fillRect(base + 500, 90, 30, 30);                   // box
+  }
+  ctx.restore();
+}
+
+function drawGround() {
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(0, GROUND_Y + 1);
+  ctx.lineTo(W, GROUND_Y + 1);
+  ctx.stroke();
+  // scrolling counter speckles
+  ctx.fillStyle = INK;
+  ctx.globalAlpha = 0.28;
+  const span = 260;
+  const off = -(dist % span);
+  for (let base = off - span; base < W + span; base += span) {
+    ctx.fillRect(base + 30, GROUND_Y + 12, 14, 2);
+    ctx.fillRect(base + 90, GROUND_Y + 22, 8, 2);
+    ctx.fillRect(base + 150, GROUND_Y + 9, 10, 2);
+    ctx.fillRect(base + 205, GROUND_Y + 18, 16, 2);
+    ctx.fillRect(base + 245, GROUND_Y + 28, 6, 2);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawPot(p) {
+  const x = p.x, y = GROUND_Y, w = p.w, h = p.h;
+  ctx.save();
+
+  if (p.flame && state === S.RUN && !reducedMotion) {
+    ctx.fillStyle = HEAT;
+    const t = performance.now() / 90;
+    for (let i = 0; i < 3; i++) {
+      const fx = x + w * (0.25 + i * 0.25);
+      const fh = 7 + Math.sin(t + i * 2.1) * 3;
+      ctx.beginPath();
+      ctx.moveTo(fx - 4, y);
+      ctx.quadraticCurveTo(fx, y - fh * 2, fx + 4, y);
+      ctx.fill();
+    }
+  }
+
+  // body
+  ctx.fillStyle = STEEL;
+  ctx.beginPath();
+  ctx.roundRect(x, y - h, w, h, [3, 3, 8, 8]);
+  ctx.fill();
+  // shine
+  ctx.fillStyle = STEEL_LT;
+  ctx.fillRect(x + 6, y - h + 8, 5, h - 14);
+  // rim
+  ctx.fillStyle = STEEL_DK;
+  ctx.beginPath();
+  ctx.roundRect(x - 3, y - h - 5, w + 6, 8, 3);
+  ctx.fill();
+
+  if (p.kind === 'sauce') {
+    // long side handle, trailing
+    ctx.strokeStyle = STEEL_DK;
+    ctx.lineWidth = 5;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x + w + 2, y - h + 8);
+    ctx.lineTo(x + w + 24, y - h + 4);
+    ctx.stroke();
+  } else {
+    // stockpot ear handles
+    ctx.strokeStyle = STEEL_DK;
+    ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(x - 2, y - h + 14, 7, Math.PI * 0.5, Math.PI * 1.5); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x + w + 2, y - h + 14, 7, -Math.PI * 0.5, Math.PI * 0.5); ctx.stroke();
+  }
+
+  // outline
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(x, y - h, w, h, [3, 3, 8, 8]);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.roundRect(x - 3, y - h - 5, w + 6, 8, 3);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function drawSteam() {
+  ctx.save();
+  for (const s of steam) {
+    const k = s.age / s.life;
+    ctx.globalAlpha = 0.35 * (1 - k);
+    ctx.fillStyle = INK;
+    const wx = s.x + Math.sin(s.wob) * 4;
+    ctx.beginPath();
+    ctx.arc(wx, s.y, s.r * (1 + k * 0.8), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawDust() {
+  ctx.save();
+  ctx.fillStyle = RUSSET_DK;
+  for (const d of dust) {
+    ctx.globalAlpha = 0.5 * (1 - d.age / d.life);
+    ctx.beginPath();
+    ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawChunks() {
+  for (const c of chunks) {
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, 2 * (1 - c.age / c.life));
+    ctx.translate(c.x, c.y);
+    ctx.rotate(c.rot);
+    ctx.fillStyle = RUSSET_LT;
+    ctx.fillRect(-c.r, -c.r, c.r * 2, c.r * 2);
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(-c.r, -c.r, c.r * 2, c.r * 2);
+    ctx.restore();
+  }
+}
+
+function drawPotato() {
+  const dead = state === S.DEAD;
+  let sx = 1, sy = 1;
+  if (dead) { sx = 1.55; sy = 0.32; }                       // mashed
+  else if (potato.squash > 0) { sx = 1.18; sy = 0.8; }      // landing squash
+  else if (!potato.onGround) { sx = 0.92; sy = 1.1; }       // air stretch
+
+  const cx = potato.x;
+  const cy = potato.y - potato.ry * sy;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  if (!dead && potato.onGround && state === S.RUN) ctx.rotate(Math.sin(potato.roll) * 0.06);
+  if (!dead && !potato.onGround) ctx.rotate(0.12);
+  ctx.scale(sx, sy);
+
+  // body: lumpy blob
+  ctx.fillStyle = RUSSET;
+  ctx.beginPath();
+  ctx.moveTo(-21, 2);
+  ctx.bezierCurveTo(-23, -12, -12, -18, 0, -17);
+  ctx.bezierCurveTo(13, -18, 22, -10, 21, 1);
+  ctx.bezierCurveTo(22, 11, 12, 17, -1, 16);
+  ctx.bezierCurveTo(-13, 17, -21, 12, -21, 2);
+  ctx.closePath();
+  ctx.fill();
+  // highlight + spots
+  ctx.fillStyle = RUSSET_LT;
+  ctx.beginPath(); ctx.ellipse(-6, -9, 8, 4, -0.4, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = SPOT;
+  ctx.beginPath(); ctx.arc(-11, 6, 1.6, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(4, 11, 1.4, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(14, -4, 1.4, 0, Math.PI * 2); ctx.fill();
+  // outline
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 2.2;
+  ctx.stroke();
+
+  // eyes (a potato has eyes)
+  if (dead) {
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = 2.4;
+    ctx.lineCap = 'round';
+    for (const ex of [4, 15]) {
+      ctx.beginPath();
+      ctx.moveTo(ex - 3, -6); ctx.lineTo(ex + 3, 0);
+      ctx.moveTo(ex + 3, -6); ctx.lineTo(ex - 3, 0);
+      ctx.stroke();
+    }
+  } else if (potato.blink > 0) {
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(2, -4); ctx.lineTo(8, -4); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(12, -4); ctx.lineTo(18, -4); ctx.stroke();
+  } else {
+    ctx.fillStyle = PAPER;
+    ctx.beginPath(); ctx.ellipse(5, -4, 4, 4.6, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(15, -4, 4, 4.6, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = INK; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.ellipse(5, -4, 4, 4.6, 0, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(15, -4, 4, 4.6, 0, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = INK;
+    const look = potato.onGround ? 1.4 : 2.2;   // eyes forward, further when airborne
+    ctx.beginPath(); ctx.arc(5 + look, -3.4, 1.8, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(15 + look, -3.4, 1.8, 0, Math.PI * 2); ctx.fill();
+  }
+
+  ctx.restore();
+
+  // little running feet
+  if (!dead && potato.onGround && state === S.RUN) {
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = 2.4;
+    ctx.lineCap = 'round';
+    const t = potato.roll * 2.4;
+    ctx.beginPath();
+    ctx.moveTo(cx - 8, potato.y - 2);
+    ctx.lineTo(cx - 8 + Math.sin(t) * 7, potato.y + 5);
+    ctx.moveTo(cx + 8, potato.y - 2);
+    ctx.lineTo(cx + 8 - Math.sin(t) * 7, potato.y + 5);
+    ctx.stroke();
+  }
+}
+
+function fmt(n) { return String(n).padStart(5, '0'); }
+
+function drawHUD() {
+  ctx.font = '700 15px ui-monospace, "SF Mono", Menlo, monospace';
+  ctx.textAlign = 'right';
+  ctx.fillStyle = INK;
+  ctx.globalAlpha = 0.55;
+  ctx.fillText('HI ' + fmt(hiScore), W - 118, 32);
+  ctx.globalAlpha = mileFlash > 0 && Math.floor(mileFlash * 10) % 2 === 0 ? 0.15 : 1;
+  ctx.fillText(fmt(score), W - 24, 32);
+  ctx.globalAlpha = 1;
+  if (muted) {
+    ctx.textAlign = 'left';
+    ctx.globalAlpha = 0.4;
+    ctx.fillText('MUTED', 24, 32);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function centered(text, y, size, weight = 900) {
+  ctx.font = `${weight} ${size}px system-ui, -apple-system, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.fillText(text, W / 2, y);
+}
+
+function drawOverlay() {
+  ctx.fillStyle = INK;
+  if (state === S.IDLE) {
+    ctx.globalAlpha = 0.85;
+    centered('Press space or tap to run', 132, 20, 700);
+    ctx.globalAlpha = 0.5;
+    centered('The pots are waiting. Don’t get mashed.', 158, 13, 500);
+    ctx.globalAlpha = 1;
+  } else if (state === S.DEAD) {
+    ctx.fillStyle = HEAT;
+    centered('MASHED!', 118, 44);
+    ctx.fillStyle = INK;
+    ctx.globalAlpha = 0.8;
+    centered(`${score} points` + (score >= hiScore && score > 0 ? '  —  new best!' : ''), 150, 16, 700);
+    ctx.globalAlpha = 0.5;
+    centered('Press space to try again', 176, 13, 500);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ---------- main loop ----------
+let last = null;
+function frame(now) {
+  if (last === null) last = now;
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+
+  update(dt);
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (shake > 0) {
+    ctx.translate((Math.random() - 0.5) * 6 * shake, (Math.random() - 0.5) * 6 * shake);
+  }
+  ctx.clearRect(-10, -10, W + 20, H + 20);
+
+  drawShelf();
+  drawGround();
+  for (const p of pots) drawPot(p);
+  drawSteam();
+  drawDust();
+  drawChunks();
+  drawPotato();
+  drawHUD();
+  drawOverlay();
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
