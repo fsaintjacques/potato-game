@@ -2,7 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#FAF3E3">
+<meta name="apple-mobile-web-app-capable" content="yes">
 <title>Hot Potato</title>
 <style>
   :root {
@@ -14,8 +16,9 @@
     --faint:  rgba(70, 52, 42, 0.45);
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { height: 100%; }
   body {
+    min-height: 100vh;
+    min-height: 100dvh;
     background: var(--paper);
     color: var(--ink);
     font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
@@ -25,6 +28,10 @@
     justify-content: center;
     gap: 18px;
     padding: 24px 16px;
+    overscroll-behavior: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
   }
   header { text-align: center; user-select: none; }
   .eyebrow {
@@ -53,7 +60,7 @@
     border: 3px solid var(--ink);
     border-radius: 10px;
     background: var(--paper);
-    touch-action: manipulation;
+    touch-action: none;
     cursor: pointer;
   }
   footer {
@@ -70,6 +77,11 @@
     padding: 1px 6px;
     margin: 0 2px;
   }
+  .touch-hints { display: none; }
+  @media (hover: none) and (pointer: coarse) {
+    .key-hints { display: none; }
+    .touch-hints { display: inline; }
+  }
 </style>
 </head>
 <body>
@@ -84,7 +96,8 @@
 </div>
 
 <footer>
-  <kbd>space</kbd>/<kbd>&uarr;</kbd> jump &nbsp;&middot;&nbsp; hold to jump higher &nbsp;&middot;&nbsp; <kbd>&darr;</kbd> dive &nbsp;&middot;&nbsp; <kbd>m</kbd> mute
+  <span class="key-hints"><kbd>space</kbd>/<kbd>&uarr;</kbd> jump &nbsp;&middot;&nbsp; hold to jump higher &nbsp;&middot;&nbsp; <kbd>&darr;</kbd> dive &nbsp;&middot;&nbsp; <kbd>m</kbd> mute</span>
+  <span class="touch-hints">tap to jump &nbsp;&middot;&nbsp; hold to jump higher &nbsp;&middot;&nbsp; swipe down to dive</span>
 </footer>
 
 <script>
@@ -92,6 +105,26 @@
 'use strict';
 
 // ---------- setup ----------
+// Safari: localStorage can throw inside a cross-origin iframe; storage is a nicety, not a dependency
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+// iOS < 16 has no ctx.roundRect
+if (!CanvasRenderingContext2D.prototype.roundRect) {
+  CanvasRenderingContext2D.prototype.roundRect = function (x, y, w, h, r) {
+    const q = Array.isArray(r) ? r : [r, r, r, r];
+    const [tl, tr, br, bl] = q.length === 4 ? q : [q[0], q[0], q[0], q[0]];
+    this.moveTo(x + tl, y);
+    this.arcTo(x + w, y, x + w, y + h, tr);
+    this.arcTo(x + w, y + h, x, y + h, br);
+    this.arcTo(x, y + h, x, y, bl);
+    this.arcTo(x, y, x + w, y, tl);
+    this.closePath();
+  };
+}
+
 const W = 900, H = 300;
 const GROUND_Y = H - 46;
 const cvs = document.getElementById('game');
@@ -107,6 +140,7 @@ fit();
 addEventListener('resize', fit);
 
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const touchDevice = matchMedia('(hover: none) and (pointer: coarse)').matches;
 
 const INK    = '#46342A';
 const PAPER  = '#FAF3E3';
@@ -121,11 +155,13 @@ const HEAT   = '#E4572E';
 
 // ---------- audio ----------
 let audioCtx = null;
-let muted = localStorage.getItem('hotpotato.muted') === '1';
+let muted = store.get('hotpotato.muted') === '1';
 
 function beep(freq, dur, type = 'square', vol = 0.04, slideTo = null) {
   if (muted) return;
-  if (!audioCtx) { try { audioCtx = new AudioContext(); } catch { return; } }
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch { return; }
+  }
   if (audioCtx.state === 'suspended') audioCtx.resume();
   const t = audioCtx.currentTime;
   const osc = audioCtx.createOscillator();
@@ -150,7 +186,7 @@ const sfx = {
 const S = { IDLE: 0, RUN: 1, DEAD: 2 };
 let state = S.IDLE;
 let score = 0;
-let hiScore = +(localStorage.getItem('hotpotato.hi') || 0);
+let hiScore = +(store.get('hotpotato.hi') || 0);
 let speed = 330, dist = 0, spawnGap = 520, diedAt = 0, mileFlash = 0, shake = 0;
 let pots = [], steam = [], dust = [], chunks = [];
 
@@ -255,15 +291,24 @@ addEventListener('keydown', (e) => {
   else if (e.code === 'ArrowDown') { e.preventDefault(); potato.diving = true; }
   else if (e.code === 'KeyM') {
     muted = !muted;
-    localStorage.setItem('hotpotato.muted', muted ? '1' : '0');
+    store.set('hotpotato.muted', muted ? '1' : '0');
   } else if (e.code === 'KeyR' && state === S.DEAD) reset();
 });
 addEventListener('keyup', (e) => {
   if (e.code === 'Space' || e.code === 'ArrowUp') jumpRelease();
   else if (e.code === 'ArrowDown') potato.diving = false;
 });
-cvs.addEventListener('pointerdown', (e) => { e.preventDefault(); jumpPress(); });
-addEventListener('pointerup', jumpRelease);
+let touchY = null;
+cvs.addEventListener('pointerdown', (e) => { e.preventDefault(); touchY = e.clientY; jumpPress(); });
+addEventListener('pointermove', (e) => {
+  if (touchY !== null && e.clientY - touchY > 28) {   // swipe down = dive
+    touchY = e.clientY;
+    potato.diving = true;
+    jumpRelease();
+  }
+});
+addEventListener('pointerup', () => { touchY = null; potato.diving = false; jumpRelease(); });
+addEventListener('pointercancel', () => { touchY = null; potato.diving = false; jumpRelease(); });
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) last = null;   // avoid a giant dt on return
@@ -360,7 +405,7 @@ function die() {
   if (!reducedMotion) shake = 1;
   if (score > hiScore) {
     hiScore = score;
-    localStorage.setItem('hotpotato.hi', String(hiScore));
+    store.set('hotpotato.hi', String(hiScore));
   }
 }
 
@@ -625,7 +670,7 @@ function drawOverlay() {
   ctx.fillStyle = INK;
   if (state === S.IDLE) {
     ctx.globalAlpha = 0.85;
-    centered('Press space or tap to run', 132, 20, 700);
+    centered(touchDevice ? 'Tap to run' : 'Press space or tap to run', 132, 20, 700);
     ctx.globalAlpha = 0.5;
     centered('The pots are waiting. Don’t get mashed.', 158, 13, 500);
     ctx.globalAlpha = 1;
@@ -636,7 +681,7 @@ function drawOverlay() {
     ctx.globalAlpha = 0.8;
     centered(`${score} points` + (score >= hiScore && score > 0 ? '  —  new best!' : ''), 150, 16, 700);
     ctx.globalAlpha = 0.5;
-    centered('Press space to try again', 176, 13, 500);
+    centered(touchDevice ? 'Tap to try again' : 'Press space to try again', 176, 13, 500);
     ctx.globalAlpha = 1;
   }
 }
